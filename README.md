@@ -95,15 +95,18 @@ X509_GUID(16) | ListSize(u32le) | HeaderSize(u32le) | SigSize(u32le) | [ Owner(1
 | Doc shape | `{ "Version":…, "Devices":{ …, "ac6b8dc1-3257-4a70-b1b2-a9c9215659ad" (Virtual BIOS): …, "States":{ "Nvram":{ "Vendors":{ "<guid>":{ "Variables":{ "db":{ "Attributes":39, "Data":[ints] } } } } } } }` |
 | `Data` array | byte values as a JSON array of ints |
 | GUESTRTS headers | two redundant 96-byte headers: **R1 @ `0x4400`** (current bank), **R2 @ `0x4600`** |
-| S fields | `R1+0x30` = doc1_len+2, `R1+0x50` = doc2_len+2 — after an edit both must equal new_doc_len+2 |
-| CRC | `header[0x0C] = zlib.crc32(header96 with bytes 12..16 zeroed)`. **Both** banks must validate. After an edit: update R1's S fields + R1 CRC; leave R2 untouched (its base CRC stays valid) |
+| S fields | `R1+0x30` = len(doc1)+2, `R1+0x50` = len(doc2)+2 — **per-doc, may legitimately differ**: the firmware itself stores different values (v1.14.5 run BASE: `247410` vs `246938` — doc1 carried a firmware-created `Boot0003` that doc2 lacked) |
+| CRC | `header[0x0C] = zlib.crc32(header96 with bytes 12..16 zeroed)`. **Both** banks must validate. After an edit: update R1's S fields + R1 CRC; leave R2 untouched (its base CRC stays valid; a stale R2 S1 is tolerated — BASE ships `R2 S1=246460` while doc1 is 247410 long, and it powers on fine) |
 | Space | new docs must fit: `0x200200 + new_len + 2 < 0x3FFDFD` |
 
 ### VMMS / firmware behavior (operational rules)
 
 1. **VMMS caches NVRAM in memory.** A file-level `.vmgs` edit only reaches the
    firmware after `Restart-Service vmms`. No VMMS NVRAM-writing cmdlet between
-   the edit and the boot.
+   the edit and the boot. In the v1.14.5 run the edit was applied with the VM
+   **Off** and took effect on the next boot **without** a VMMS restart — keep
+   the restart as the conservative default when other VMs are running or the
+   VMMS state is uncertain.
 2. **Every `Stop-VM` and every failed boot makes the firmware rewrite
    `.vmgs`**, clobbering file-level edits. Keep an immutable **BASE** backup
    (a known-good, power-on-capable `.vmgs`) and **rebuild every attempt from
@@ -266,8 +269,14 @@ Set-VMDvdDrive -VMName Talos -Path $null
 
 ### Step 8 — Verify the installed system (mTLS — `--insecure` is gone)
 
-Install takes ~2–5 min (image pull + write + reboot + first boot); poll for
-the new static IP (192.168.1.50 in the example).
+Install takes ~2–5 min (image pull + write + reboot). The **first boot of the
+installed system is then slow**: the kernel is up ~1 min after power-on (the
+dmesg timestamps show it), but the machine API + node network can take
+**~10+ min** (image pulls) — ~11 min in the v1.14.5 run on 2 GB / 1 vCPU;
+giving the VM more RAM/CPU shortens the window. The console stays **black**
+on a running installed node — there is no TUI — and VM CPU 0% is normal in
+that window. Don't diagnose a "dead" node from the console before ~15 min;
+poll the new static IP (192.168.1.50 in the example) instead.
 
 **After `apply-config`, `--insecure` no longer works** — the maintenance
 service is off and the machine API demands mTLS (symptom:
@@ -292,18 +301,49 @@ talosctl.exe gen crt --ca ca --csr client.csr --name client --hours 8760
 python talosconfig_build.py build $tc 192.168.1.50 talos
 ```
 
-Then verify and bootstrap:
+Then verify and bootstrap — **bootstrap first**: a single control-plane node
+stays in `STAGE=booting` (etcd pre-stage waiting) until `talosctl bootstrap`
+runs, and `talosctl health` (default wait 20 min) blocks on etcd in the
+meantime:
 
 ```powershell
-talosctl.exe version           --talosconfig $tc\talosconfig.yaml
-talosctl.exe get machinestatus --talosconfig $tc\talosconfig.yaml   # STAGE=running READY=true
-talosctl.exe health            --talosconfig $tc\talosconfig.yaml   # all checks OK, exit 0
+# 1) confirm the node is reachable over mTLS
+talosctl.exe version --talosconfig $tc\talosconfig.yaml   # Server: v1.14.5
 
-# bootstrap the single-node control plane, then pull the admin kubeconfig
-talosctl.exe bootstrap         --talosconfig $tc\talosconfig.yaml   # exit 0
-talosctl.exe kubeconfig "$tc\kubeconfig.yaml" --merge=false --talosconfig $tc\talosconfig.yaml
-kubectl get nodes --kubeconfig "$tc\kubeconfig.yaml"                # Ready
+# 2) bootstrap the single-node control plane (exit 0); STAGE=running READY=true
+#    follows ~2 min later (watch with: talosctl get machinestatus)
+talosctl.exe bootstrap --talosconfig $tc\talosconfig.yaml
+
+# 3) health once the node is up
+talosctl.exe health --talosconfig $tc\talosconfig.yaml --wait-timeout 120s   # all checks OK, exit 0
+
+# 4) pull the admin kubeconfig, then verify with kubectl
+talosctl.exe kubeconfig "$tc\kubeconfig.yaml" -f --merge=false --talosconfig $tc\talosconfig.yaml
+kubectl get nodes --kubeconfig "$tc\kubeconfig.yaml"   # Ready, control-plane
 ```
+
+**kubeconfig merge note:** `talosctl kubeconfig` with no path **merges into
+`~/.kube/config`** by default (adds a `mycluster` context alongside any
+existing clusters). For a standalone file use `-f --merge=false <path>`
+(`-f` overwrites an existing file).
+
+**Waiting state (normal, not a fault):** while the node awaits bootstrap,
+`talosctl health --wait-timeout 5s` reports the etcd pre-stage failing every
+~15 s:
+
+```
+service "etcd" ... current state [Failed] Failed to run pre stage:
+failed to build initial etcd cluster: failed to build cluster arguments: timeout
+```
+
+That loop *is* the waiting state (cf. siderolabs/talos#10806): the pre-stage
+retries until `talosctl bootstrap` is issued. Use it, together with
+`talosctl logs machined --tail N | Select-String 'controller failed|etcd'`,
+to distinguish "waiting" from a real failure. Related symptoms while etcd
+isn't up yet: `talosctl logs etcd` fails with `log "etcd" was not registered`
+(the container hasn't started), and kubelet logs show
+`Authorization error (user=apiserver-kubelet-client …)` — a downstream
+symptom of the API server not being up, not an RBAC bug.
 
 Runtime proof that Secure Boot survived the install — from the *installed*
 kernel (also shows the db the kernel parses for module signing):
@@ -321,10 +361,44 @@ image) and verifies against the **same** `db` entry, which the firmware
 persists in NVRAM across reboots — the final system boots with Secure Boot
 ON with no further work.
 
-Optional: rewrite `BootOrder` in both NVRAM docs to put the disk first
-(same-length-safe edit + S fields + CRCs, same technique as the `db`
-injection) — or leave it; with the DVD ejected the firmware falls through to
-the disk fine.
+### Step 9 — Post-install: put the disk first in the boot order
+
+A fresh Gen 2 VM's firmware boot list contains a **network (PXE) entry** that
+can sit **ahead of the disk**. With that order, every power-on first tries
+network boot and waits out the PXE timeout before falling through to the disk
+— a noticeable delay on **every** boot. (It also matters if your LAN ever
+serves PXE/HTTP images.)
+
+Once the install is verified (step 8), make the disk the first entry:
+
+- **Hyper-V Manager:** VM → *Firmware* → *Boot Entries* → move the
+  **"EFI SCSI Device"** entry to the top.
+- **PowerShell** — verified pattern. The `BootOrder` parameter takes
+  `VMComponentObject[]` (the `VMBootSource` objects from `Get-VMFirmware`);
+  bare strings like `Drive, Network` **do not bind**:
+
+  ```powershell
+  $fw    = Get-VMFirmware -VMName Talos
+  $drive = @($fw.BootOrder | Where-Object { $_.BootType -eq 'Drive' })[0]
+  $rest  = @($fw.BootOrder | Where-Object { $_ -ne $drive })
+  Set-VMFirmware -VMName Talos -BootOrder (@($drive) + $rest)
+
+  (Get-VMFirmware -VMName Talos).BootOrder |
+      ForEach-Object { "{0} - {1}" -f $_.BootType, $_.Description }
+  # Drive   - EFI SCSI Device
+  # Network - EFI Network
+  ```
+
+  `VMBootSourceType` values: `Drive`, `Network`, `File` (plus `Unknown`).
+  The change takes effect at the **next** boot; the VM may stay running
+  while you apply it.
+
+Post-install cleanup, while you're at it:
+
+- Remove the now-empty DVD drive entirely — `Remove-VMDvdDrive -VMName Talos`
+  (step 7 only *ejects* it, in time for the install reboot).
+- If the first-boot window (step 8) was too long, give the VM more RAM/CPU —
+  the ~11 min on 2 GB / 1 vCPU is image-pull time, not a boot-chain problem.
 
 ## Talos v1.14 machine-config quick reference
 
@@ -359,6 +433,10 @@ A ready-to-edit template for the install/network/endpoint documents is
 | `unknown command "status"` / `"read-file"` (v1.14) | commands renamed vs ≤1.13 | `talosctl get machinestatus`, `talosctl health`, `talosctl read <path>` |
 | talosctl `unknown keys found during decoding` (e.g. `machine.network.dns`) | v1.14 moved those fields out of `v1alpha1` | use the resource documents instead (see the table above) |
 | `"Config" "v1alpha1": not registered` | config file starts with `apiVersion:`/`kind: Config` | v1.14 files start with `version: v1alpha1`; generate with `talosctl gen config` |
+| `failed to build initial etcd cluster: failed to build cluster arguments: timeout` looping every ~15 s | single control-plane node **awaiting `talosctl bootstrap`** — the waiting state, not a fault | run `talosctl bootstrap`; node reaches `running/true` in ~2 min |
+| `log "etcd" was not registered` (`talosctl logs etcd`) | etcd container hasn't started (pre-stage waiting/stuck) | surface the pre-stage state with `talosctl health --wait-timeout 5s`; bootstrap |
+| kubelet `Authorization error (user=apiserver-kubelet-client …)` | API server not fully up yet (downstream symptom) | wait for bootstrap to finish; not an RBAC bug |
+| Black console + VM CPU 0% after the install reboot | slow first boot of the installed node (kernel ~1 min, machine API/network ~10+ min; no TUI on an installed node) | wait up to ~15 min; check `talosctl dmesg` timestamps and ping the static IP |
 | GitHub release download resets/401 | artifact/auth quirks | `curl.exe -sSL`; list exact asset names via the API |
 | Defender quarantines `ps/vm_console_shot.ps1` | screen-capture + P/Invoke heuristic (false positive) | review the content; add an exclusion for the repo folder |
 
@@ -370,3 +448,7 @@ A ready-to-edit template for the install/network/endpoint documents is
 | Append Sidero cert to `db` with `SigSize = 32 + cert` (extra X509_GUID inside signature data) | firmware accepted the db, boot looped (cert read as 16 zero bytes + cert) |
 | Append Sidero cert to `db` with `SigSize = 16 + cert`, zero owner, both docs, R1 S fields + CRC | **Boots.** Shim + UKI verified; installer TUI with `SECUREBOOT ✓ True` |
 | VmgsTool (microsoft/openvmm) | prebuilt artifacts need GitHub auth; not needed — byte-level editing proven sufficient |
+| Black console + CPU 0% after the install reboot | **Not** a firmware/Secure Boot failure — the installed node has no TUI and its first boot is slow (kernel up ~1 min after power-on; node network up ~11 min in the v1.14.5 run). The db edit also survived the normal post-install firmware rewrite of the live `.vmgs` (hash `7cd79a914f836212`, db intact) and took effect **without** a VMMS restart (VM was Off at edit time). |
+| etcd pre-stage loop `failed to build cluster arguments: timeout` after install | the single-CP node's **waiting state** for `talosctl bootstrap` (cf. siderolabs/talos#10806) — bootstrap resolved it in ~2 min, then `talosctl health --wait-timeout 120s` all-OK and `kubectl get nodes` Ready |
+| Post-install ESP forensics | firmware boots device-only `Boot0001` → `\EFI\BOOT\BOOTX64.EFI` (0.2 MB **systemd-boot**, Sidero-signed) which auto-detects the 111 MB UKI `\EFI\Linux\Talos-v1.14.5.efi` (Sidero-signed, cmdline has `module.sig_enforce=1`); `loader.conf`'s `# systemd-boot configuration` header + systemd-boot's `Loader*` NVRAM vars (vendor `4a67b082`) prove the loader ran and selected the UKI — the boot chain needed no NVRAM intervention |
+| Boot order: network (PXE) entry ahead of the disk on a fresh Gen 2 VM | every boot paid a PXE timeout before reaching the disk — after the install is verified, set `Drive, Network` (step 9): `Set-VMFirmware -BootOrder` with the `VMBootSource` objects reordered from `Get-VMFirmware` (bare strings don't bind), or the Hyper-V Manager *Boot Entries* list; no `.vmgs` edit needed |
