@@ -13,6 +13,11 @@ firmware `db` — no further work needed).
 No MOK, no third-party firmware, no signed shim chain: a byte-level edit of the
 VM's NVRAM store.
 
+> **Generic variant:** the same mechanism, vendor-neutral (any key, any OS,
+> `db` and `dbx`), is packaged as a standalone toolkit in
+> [michaeltg17/hyper-v-secure-boot-custom-keys](https://github.com/michaeltg17/hyper-v-secure-boot-custom-keys) —
+> this repo remains the Talos-specific, proven runbook.
+
 ## Why this is hard (root cause)
 
 With `MicrosoftUEFICertificateAuthority`, the Hyper-V UEFI firmware verifies
