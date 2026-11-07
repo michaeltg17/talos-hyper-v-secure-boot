@@ -261,7 +261,7 @@ If the DVD is first in the boot order, a still-attached ISO makes the VM boot
 the installer again after the install reboot:
 
 ```powershell
-Set-VMDvdDrive -VMName Talos -DevicePath $null
+Set-VMDvdDrive -VMName Talos -Path $null
 ```
 
 ### Step 8 — Verify the installed system (mTLS — `--insecure` is gone)
