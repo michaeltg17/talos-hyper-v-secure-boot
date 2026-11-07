@@ -31,10 +31,13 @@ Format facts (verified):
     GUID bytes in this NVRAM are stored in hex-string order
     (a159c0a5e494a74a...), not EFI little-endian field order.
   * Two 96-byte GUESTRTS redundancy headers: R1 @ 0x4400 (current bank),
-    R2 @ 0x4600. S1 @ R1+0x30 and S2 @ R1+0x50 must equal doc_len+2 after an
-    edit; cksum @ +0x0C = zlib.crc32(96-byte header with bytes 12..16 zeroed).
+    R2 @ 0x4600. S1 @ R1+0x30 and S2 @ R1+0x50 must equal len(doc1)+2 and
+    len(doc2)+2 after an edit; cksum @ +0x0C = zlib.crc32(96-byte header
+    with bytes 12..16 zeroed). The two docs are NOT guaranteed identical
+    (the firmware may create a boot option on first boot that lands in the
+    current bank only, doc1), so the builder tracks per-doc lengths.
     After an edit: update R1 S fields + R1 CRC; R2 stays untouched (its base
-    CRC remains valid). BOTH banks must validate.
+    CRC remains valid; a stale R2 S1 is tolerated, see below).
 """
 import argparse
 import hashlib
@@ -213,20 +216,33 @@ def main():
 
     n1 = replace_db(d1t, 'doc1')
     n2 = replace_db(d2t, 'doc2')
-    new_len = len(n1.encode('utf-16-le'))
-    if len(n2.encode('utf-16-le')) != new_len:
-        sys.exit('doc sizes differ after edit')
-    print('new doc size = %d (both)' % new_len)
-    if DOC1 + new_len + 2 >= DOC2 or DOC2 + new_len + 2 >= 0x3FFDFD:
+    new_len1 = len(n1.encode('utf-16-le'))
+    new_len2 = len(n2.encode('utf-16-le'))
+    old_len1 = len(d1t.encode('utf-16-le'))
+    old_len2 = len(d2t.encode('utf-16-le'))
+    # the db replacement is identical in both docs, so both grow by the same
+    # delta even though the docs themselves may differ (e.g. a Boot000X the
+    # firmware created on first boot lives in doc1 only)
+    if not (new_len1 > old_len1 and new_len2 > old_len2):
+        sys.exit('db replacement did not grow both docs')
+    if new_len1 - old_len1 != new_len2 - old_len2:
+        sys.exit('docs grew by different amounts (%d vs %d)'
+                 % (new_len1 - old_len1, new_len2 - old_len2))
+    print('new doc sizes = %d (doc1) / %d (doc2)' % (new_len1, new_len2))
+    if DOC1 + new_len1 + 2 >= DOC2 or DOC2 + new_len2 + 2 >= 0x3FFDFD:
         sys.exit('new docs do not fit in the file')
+    # growth must not overwrite anything non-zero (padding only)
+    if any(orig[DOC1 + old_len1 + 2:DOC1 + new_len1 + 2]) \
+       or any(orig[DOC2 + old_len2 + 2:DOC2 + new_len2 + 2]):
+        sys.exit('doc growth would overwrite non-zero bytes')
 
     out = bytearray(orig)
-    out[DOC1:DOC1 + new_len] = n1.encode('utf-16-le')
-    out[DOC1 + new_len:DOC1 + new_len + 2] = b'\x00\x00'
-    out[DOC2:DOC2 + new_len] = n2.encode('utf-16-le')
-    out[DOC2 + new_len:DOC2 + new_len + 2] = b'\x00\x00'
-    struct.pack_into('<I', out, R1B + 0x30, new_len + 2)
-    struct.pack_into('<I', out, R1B + 0x50, new_len + 2)
+    out[DOC1:DOC1 + new_len1] = n1.encode('utf-16-le')
+    out[DOC1 + new_len1:DOC1 + new_len1 + 2] = b'\x00\x00'
+    out[DOC2:DOC2 + new_len2] = n2.encode('utf-16-le')
+    out[DOC2 + new_len2:DOC2 + new_len2 + 2] = b'\x00\x00'
+    struct.pack_into('<I', out, R1B + 0x30, new_len1 + 2)
+    struct.pack_into('<I', out, R1B + 0x50, new_len2 + 2)
     struct.pack_into('<I', out, R1B + 0x0C, hdr_crc(out[R1B:R1B + 96]))
 
     b = bytes(out)
@@ -238,11 +254,11 @@ def main():
     r1s2 = struct.unpack_from('<I', b, R1B + 0x50)[0]
     print('R1 S=(%d,%d) CRC=0x%08X OK; R2 untouched'
           % (r1s1, r1s2, struct.unpack_from('<I', b, R1B + 0x0C)[0]))
-    if r1s1 != r1s2 or r1s1 != new_len + 2:
+    if r1s1 != new_len1 + 2 or r1s2 != new_len2 + 2:
         sys.exit('R1 S fields wrong')
 
     # byte-diff audit: ONLY the docs + R1 header bytes may change
-    expect = (set(range(DOC1, DOC1 + new_len + 2)) | set(range(DOC2, DOC2 + new_len + 2))
+    expect = (set(range(DOC1, DOC1 + new_len1 + 2)) | set(range(DOC2, DOC2 + new_len2 + 2))
               | set(range(R1B + 0x0C, R1B + 0x10)) | set(range(R1B + 0x30, R1B + 0x34))
               | set(range(R1B + 0x50, R1B + 0x54)))
     changed = [i for i in range(len(b)) if b[i] != orig[i]]
@@ -254,8 +270,9 @@ def main():
     dd = find_docs(b)
     if len(dd) != 2 or dd[0][0] != DOC1 or dd[1][0] != DOC2:
         sys.exit('docs not re-found after build')
-    for (_s, t) in dd:
-        if len(t.encode('utf-16-le')) != new_len:
+    exp_lens = {DOC1: new_len1, DOC2: new_len2}
+    for (s, t) in dd:
+        if len(t.encode('utf-16-le')) != exp_lens[s]:
             sys.exit('doc size mismatch after build')
     for g in GPT_OFFS:
         if b[g:g + 92] != orig[g:g + 92]:
