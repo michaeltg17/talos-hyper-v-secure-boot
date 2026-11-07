@@ -1,0 +1,6 @@
+# opencode session artifact
+opencode.json
+
+# python
+__pycache__/
+*.py[cod]

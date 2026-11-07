@@ -1,0 +1,76 @@
+# =============================================================================
+# talos-config.yaml — Talos Linux v1.14 machine config: the documents you control
+# =============================================================================
+#
+# A Talos v1.14 machine config is a MULTI-DOCUMENT YAML. The PKI, tokens and
+# cluster identity documents must be GENERATED (do not hand-write certificates):
+#
+#   talosctl gen config <cluster-name> https://<cluster-vip>:6443 \
+#     --install-image factory.talos.dev/metal-installer-secureboot/<IMAGE-HASH>:v1.14.5 \
+#     --install-disk /dev/sda \
+#     -t controlplane -o talos-controlplane.yaml --force
+#
+# gen config already emits the UnattendedInstallConfig (installer image + disk)
+# and the KubeClusterConfig (endpoint). What you usually still add by hand is
+# the static addressing (LinkConfig) and, optionally, the DNS (ResolverConfig)
+# — which is what this file templates. Append the documents below to the
+# generated file, then apply:
+#
+#   talosctl apply-config --insecure --nodes <installer-ip> -f talos-controlplane.yaml
+#
+# Example values below (replace with your own):
+#   LAN         192.168.1.0/24
+#   gateway     192.168.1.1
+#   node IP     192.168.1.50
+# =============================================================================
+
+# --- install: which disk and which installer image to pull -------------------
+# installer.image MUST be the secureboot installer whose schematic matches the
+# secureboot ISO you booted (same hash) — otherwise the installed boot chain
+# is not the one the firmware verified. `gen config` fills this in when you
+# pass --install-image; shown here for reference.
+apiVersion: v1alpha1
+kind: UnattendedInstallConfig
+installer:
+    image: factory.talos.dev/metal-installer-secureboot/<IMAGE-HASH>:v1.14.5
+provisioning:
+    diskSelector:
+        match: disk.dev_path == "/dev/sda"
+    # wipe: true   # default; omit for a fresh disk
+
+# --- static addressing for the primary interface ------------------------------
+# `name` must be the REAL link name inside the guest. Talos 1.14 uses the
+# kernel's MAC-derived names, e.g. `enx00155d01640c` for MAC 00:15:5d:01:64:0c
+# — verify with `talosctl get links --insecure --nodes <ip>` (a wrong name just
+# means the node keeps its DHCP IP; re-applying is safe).
+apiVersion: v1alpha1
+kind: LinkConfig
+name: enx00155d01640c
+addresses:
+    - address: 192.168.1.50/24
+routes:
+    # omit `destination` to create the default route via the gateway
+    # (do NOT write 0.0.0.0/0 — the validator rejects it)
+    - gateway: 192.168.1.1
+
+# --- DNS ----------------------------------------------------------------------
+# Optional: Talos' built-in default is already 1.1.1.1 + 8.8.8.8. Include this
+# to make the resolver explicit (it is also the place for DoT/DoH nameservers).
+apiVersion: v1alpha1
+kind: ResolverConfig
+nameservers:
+    - address: 1.1.1.1
+    - address: 8.8.8.8
+
+# --- cluster endpoint (replaces the old `machine.vip`) -------------------------
+# For a single control-plane node this is the node's own IP. `gen config`
+# emits this document when you pass the endpoint to the gen command.
+apiVersion: v1alpha1
+kind: KubeClusterConfig
+clusterName: <CLUSTER-NAME>
+endpoint: https://192.168.1.50:6443
+
+# --- optional: fixed hostname instead of the auto-generated stable one --------
+# apiVersion: v1alpha1
+# kind: HostnameConfig
+# hostname: talos-cp1
